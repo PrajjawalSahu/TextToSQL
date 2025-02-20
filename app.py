@@ -1,5 +1,5 @@
 from transformers import T5Tokenizer, T5ForConditionalGeneration
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncpg  # PostgreSQL async driver
@@ -28,7 +28,7 @@ app.add_middleware(
 # tokenizer = T5Tokenizer.from_pretrained(model_dir)
 
 # Load the fine-tuned T5 model and tokenizer
-model_dir = "./flan-t5-base"  # Replace with your model path
+model_dir = "../flan-t5-base"  # Replace with your model path
 print("Loading the model...")
 model = T5ForConditionalGeneration.from_pretrained(model_dir)
 print("Model loaded successfully!")
@@ -65,37 +65,42 @@ async def connect_db():
 # Pydantic model for request validation (JSON body)
 class QueryRequest(BaseModel):
     query: str
+    schema_details: str = ""  # Optional schema details
 
-@app.get("/")
-def main():
-    return {"message": "Welcome to the Text-to-SQL Demo API"}
+class SQLExecutionRequest(BaseModel):
+    sql_query: str
 
-@app.post("/tosql")
-async def to_sql(request: QueryRequest):
-    # Connect to DB if not connected
-    await connect_db()
-
-    # Tokenizing the English query
-    inputs = tokenizer(request.query, return_tensors="pt", max_length=128, truncation=True)
+@app.post("/generate_sql")
+async def generate_sql(request: QueryRequest):
+    """ Converts English query to SQL and executes it immediately """
+    # Append schema details to the query
+    formatted_query = f"{request.schema_details}\n\nQuestion: {request.query}"
     
-    # Generating the SQL query
-    outputs = model.generate(
-        inputs.input_ids,
-        max_length=256,
-        num_beams=8,
-        early_stopping=True
-    )
-    
-    # Decoding the SQL query
+    inputs = tokenizer(formatted_query, return_tensors="pt", max_length=256, truncation=True)
+    outputs = model.generate(inputs.input_ids, max_length=256, num_beams=8, early_stopping=True)
     sql_query = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
+
+    # Execute SQL immediately
+    result = []
+    error = None
+    await connect_db()
     try:
-        # Execute the SQL query
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(sql_query)
-            result = [dict(row) for row in rows]  # Convert rows to dictionary format
+            result = [dict(row) for row in rows]
+    except Exception as e:
+        error = str(e)
 
-        return {"sql_query": sql_query, "results": result}
+    return {"sql_query": sql_query, "results": result, "error": error}
 
+@app.post("/execute_sql")
+async def execute_sql(request: SQLExecutionRequest):
+    """ Executes an SQL query on the database """
+    await connect_db()
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(request.sql_query)
+            result = [dict(row) for row in rows]
+        return {"results": result}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"SQL Execution Error: {str(e)}")
